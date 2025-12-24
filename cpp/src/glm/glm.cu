@@ -46,6 +46,164 @@ void olsFit(const raft::handle_t& handle,
     handle, input, n_rows, n_cols, labels, coef, intercept, fit_intercept, algo, sample_weight);
 }
 
+void olsFitDeviceIntercept(const raft::handle_t& handle,
+                           float* input,
+                           size_t n_rows,
+                           size_t n_cols,
+                           float* labels,
+                           float* coef,
+                           float* intercept_device,
+                           bool fit_intercept,
+                           int algo,
+                           float* sample_weight)
+{
+  detail::olsFitDeviceIntercept(handle,
+                               input,
+                               n_rows,
+                               n_cols,
+                               labels,
+                               coef,
+                               intercept_device,
+                               fit_intercept,
+                               algo,
+                               sample_weight);
+}
+
+void olsFitDeviceIntercept(const raft::handle_t& handle,
+                           double* input,
+                           size_t n_rows,
+                           size_t n_cols,
+                           double* labels,
+                           double* coef,
+                           double* intercept_device,
+                           bool fit_intercept,
+                           int algo,
+                           double* sample_weight)
+{
+  detail::olsFitDeviceIntercept(handle,
+                               input,
+                               n_rows,
+                               n_cols,
+                               labels,
+                               coef,
+                               intercept_device,
+                               fit_intercept,
+                               algo,
+                               sample_weight);
+}
+
+void olsFitDeviceInterceptWorkspace(const raft::handle_t& handle,
+                                    float* input,
+                                    size_t n_rows,
+                                    size_t n_cols,
+                                    float* labels,
+                                    float* coef,
+                                    float* intercept_device,
+                                    float* mu_input,
+                                    float* mu_labels,
+                                    bool fit_intercept,
+                                    int algo,
+                                    float* sample_weight)
+{
+  detail::olsFitDeviceInterceptWorkspace(handle,
+                                        input,
+                                        n_rows,
+                                        n_cols,
+                                        labels,
+                                        coef,
+                                        intercept_device,
+                                        mu_input,
+                                        mu_labels,
+                                        fit_intercept,
+                                        algo,
+                                        sample_weight);
+}
+
+void olsFitDeviceInterceptWorkspace(const raft::handle_t& handle,
+                                    double* input,
+                                    size_t n_rows,
+                                    size_t n_cols,
+                                    double* labels,
+                                    double* coef,
+                                    double* intercept_device,
+                                    double* mu_input,
+                                    double* mu_labels,
+                                    bool fit_intercept,
+                                    int algo,
+                                    double* sample_weight)
+{
+  detail::olsFitDeviceInterceptWorkspace(handle,
+                                        input,
+                                        n_rows,
+                                        n_cols,
+                                        labels,
+                                        coef,
+                                        intercept_device,
+                                        mu_input,
+                                        mu_labels,
+                                        fit_intercept,
+                                        algo,
+                                        sample_weight);
+}
+
+void olsFitDeviceInterceptWorkspaceAsyncInfo(const raft::handle_t& handle,
+                                            float* input,
+                                            size_t n_rows,
+                                            size_t n_cols,
+                                            float* labels,
+                                            float* coef,
+                                            float* intercept_device,
+                                            float* mu_input,
+                                            float* mu_labels,
+                                            int* dev_info_out,
+                                            bool fit_intercept,
+                                            int algo,
+                                            float* sample_weight)
+{
+  detail::olsFitDeviceInterceptWorkspaceAsyncInfo(handle,
+                                                 input,
+                                                 n_rows,
+                                                 n_cols,
+                                                 labels,
+                                                 coef,
+                                                 intercept_device,
+                                                 mu_input,
+                                                 mu_labels,
+                                                 dev_info_out,
+                                                 fit_intercept,
+                                                 algo,
+                                                 sample_weight);
+}
+
+void olsFitDeviceInterceptWorkspaceAsyncInfo(const raft::handle_t& handle,
+                                            double* input,
+                                            size_t n_rows,
+                                            size_t n_cols,
+                                            double* labels,
+                                            double* coef,
+                                            double* intercept_device,
+                                            double* mu_input,
+                                            double* mu_labels,
+                                            int* dev_info_out,
+                                            bool fit_intercept,
+                                            int algo,
+                                            double* sample_weight)
+{
+  detail::olsFitDeviceInterceptWorkspaceAsyncInfo(handle,
+                                                 input,
+                                                 n_rows,
+                                                 n_cols,
+                                                 labels,
+                                                 coef,
+                                                 intercept_device,
+                                                 mu_input,
+                                                 mu_labels,
+                                                 dev_info_out,
+                                                 fit_intercept,
+                                                 algo,
+                                                 sample_weight);
+}
+
 void gemmPredict(const raft::handle_t& handle,
                  const float* input,
                  size_t n_rows,

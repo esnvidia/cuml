@@ -49,6 +49,114 @@ void olsFit(const raft::handle_t& handle,
 /** @} */
 
 /**
+ * @defgroup olsFitDeviceIntercept fit an ordinary least squares model (device intercept output)
+ *
+ * Same as `olsFit`, but writes intercept to device memory to avoid host synchronization.
+ *
+ * @param intercept_device device pointer to hold the solution for bias term of size 1
+ * @{
+ */
+void olsFitDeviceIntercept(const raft::handle_t& handle,
+                           float* input,
+                           size_t n_rows,
+                           size_t n_cols,
+                           float* labels,
+                           float* coef,
+                           float* intercept_device,
+                           bool fit_intercept,
+                           int algo             = 0,
+                           float* sample_weight = nullptr);
+void olsFitDeviceIntercept(const raft::handle_t& handle,
+                           double* input,
+                           size_t n_rows,
+                           size_t n_cols,
+                           double* labels,
+                           double* coef,
+                           double* intercept_device,
+                           bool fit_intercept,
+                           int algo              = 0,
+                           double* sample_weight = nullptr);
+/** @} */
+
+/**
+ * @defgroup olsFitDeviceInterceptWorkspace fit an ordinary least squares model (caller-provided workspace)
+ *
+ * Same as `olsFitDeviceIntercept`, but reuses caller-provided buffers for `mu_input` and `mu_labels`
+ * to avoid per-fit device allocations (important for many small fits / multi-stream).
+ *
+ * @param mu_input device pointer for column-wise means of size n_cols (required if fit_intercept=true)
+ * @param mu_labels device pointer for label mean of size 1 (required if fit_intercept=true)
+ * @{
+ */
+void olsFitDeviceInterceptWorkspace(const raft::handle_t& handle,
+                                    float* input,
+                                    size_t n_rows,
+                                    size_t n_cols,
+                                    float* labels,
+                                    float* coef,
+                                    float* intercept_device,
+                                    float* mu_input,
+                                    float* mu_labels,
+                                    bool fit_intercept,
+                                    int algo             = 0,
+                                    float* sample_weight = nullptr);
+void olsFitDeviceInterceptWorkspace(const raft::handle_t& handle,
+                                    double* input,
+                                    size_t n_rows,
+                                    size_t n_cols,
+                                    double* labels,
+                                    double* coef,
+                                    double* intercept_device,
+                                    double* mu_input,
+                                    double* mu_labels,
+                                    bool fit_intercept,
+                                    int algo              = 0,
+                                    double* sample_weight = nullptr);
+/** @} */
+
+/**
+ * @defgroup olsFitDeviceInterceptWorkspaceAsyncInfo fit an ordinary least squares model (caller workspace + async devInfo)
+ *
+ * Same as `olsFitDeviceInterceptWorkspace`, but avoids per-fit host synchronization by writing solver
+ * status into caller-provided device memory (`dev_info_out`). The caller can validate devInfo once
+ * after a batch completes.
+ *
+ * For algorithms that do not expose a meaningful devInfo in the reference implementation, this
+ * function writes 0.
+ *
+ * @param dev_info_out device pointer to an array of 2 ints:
+ *   dev_info_out[0] = primary solver devInfo, dev_info_out[1] = secondary (e.g., QR ormqr).
+ * @{
+ */
+void olsFitDeviceInterceptWorkspaceAsyncInfo(const raft::handle_t& handle,
+                                            float* input,
+                                            size_t n_rows,
+                                            size_t n_cols,
+                                            float* labels,
+                                            float* coef,
+                                            float* intercept_device,
+                                            float* mu_input,
+                                            float* mu_labels,
+                                            int* dev_info_out,
+                                            bool fit_intercept,
+                                            int algo             = 0,
+                                            float* sample_weight = nullptr);
+void olsFitDeviceInterceptWorkspaceAsyncInfo(const raft::handle_t& handle,
+                                            double* input,
+                                            size_t n_rows,
+                                            size_t n_cols,
+                                            double* labels,
+                                            double* coef,
+                                            double* intercept_device,
+                                            double* mu_input,
+                                            double* mu_labels,
+                                            int* dev_info_out,
+                                            bool fit_intercept,
+                                            int algo              = 0,
+                                            double* sample_weight = nullptr);
+/** @} */
+
+/**
  * @defgroup ridgeFit fit a ridge regression model (l2 regularized least squares)
  * @param input         device pointer to feature matrix n_rows x n_cols
  * @param n_rows        number of rows of the feature matrix

@@ -8,6 +8,65 @@ import warnings
 import cupy as cp
 import numpy as np
 
+_PACK_SLICE_KERNELS = {}
+
+
+def _get_pack_slice_kernels(dtype):
+    """Lazy-create CuPy RawKernels used by the slice fast-path packing."""
+    key = str(np.dtype(dtype))
+    k = _PACK_SLICE_KERNELS.get(key)
+    if k is not None:
+        return k
+
+    if np.dtype(dtype) == np.float32:
+        ctype = "float"
+    elif np.dtype(dtype) == np.float64:
+        ctype = "double"
+    else:
+        raise TypeError(f"Unsupported dtype for slice packing: {dtype}")
+
+    code = f"""
+    extern "C" __global__
+    void pack_X(const {ctype}* X,
+                long long x_s0, long long x_s1,
+                int n_cols,
+                const long long* starts,
+                const long long* lens,
+                {ctype}* out,
+                long long o_s0, long long o_s1, long long o_s2)
+    {{
+      int r = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+      int c = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+      int m = (int)blockIdx.z;
+      long long len = lens[m];
+      if (r >= len || c >= n_cols) return;
+      long long start = starts[m];
+      out[(long long)r * o_s0 + (long long)c * o_s1 + (long long)m * o_s2] =
+        X[(start + (long long)r) * x_s0 + (long long)c * x_s1];
+    }}
+
+    extern "C" __global__
+    void pack_y(const {ctype}* y,
+                long long y_s0,
+                const long long* starts,
+                const long long* lens,
+                {ctype}* out,
+                long long o_s0, long long o_s1)
+    {{
+      int r = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+      int m = (int)blockIdx.z;
+      long long len = lens[m];
+      if (r >= len) return;
+      long long start = starts[m];
+      out[(long long)r * o_s0 + (long long)m * o_s1] =
+        y[(start + (long long)r) * y_s0];
+    }}
+    """
+    kx = cp.RawKernel(code, "pack_X")
+    ky = cp.RawKernel(code, "pack_y")
+    _PACK_SLICE_KERNELS[key] = (kx, ky)
+    return kx, ky
+
 from cuml.common import input_to_cuml_array
 from cuml.common.array_descriptor import CumlArrayDescriptor
 from cuml.common.doc_utils import generate_docstring
@@ -26,6 +85,7 @@ from cuml.linear_model.base import LinearPredictMixin
 from libc.stdint cimport uintptr_t
 from libcpp cimport bool
 from pylibraft.common.handle cimport handle_t
+from libc.stdint cimport int32_t
 
 
 cdef extern from "cuml/linear_model/glm.hpp" namespace "ML::GLM" nogil:
@@ -51,6 +111,82 @@ cdef extern from "cuml/linear_model/glm.hpp" namespace "ML::GLM" nogil:
                      bool fit_intercept,
                      int algo,
                      double *sample_weight) except +
+
+    cdef void olsFitDeviceIntercept(handle_t& handle,
+                                   float *input,
+                                   size_t n_rows,
+                                   size_t n_cols,
+                                   float *labels,
+                                   float *coef,
+                                   float *intercept_device,
+                                   bool fit_intercept,
+                                   int algo,
+                                   float *sample_weight) except +
+
+    cdef void olsFitDeviceIntercept(handle_t& handle,
+                                   double *input,
+                                   size_t n_rows,
+                                   size_t n_cols,
+                                   double *labels,
+                                   double *coef,
+                                   double *intercept_device,
+                                   bool fit_intercept,
+                                   int algo,
+                                   double *sample_weight) except +
+
+    cdef void olsFitDeviceInterceptWorkspace(handle_t& handle,
+                                            float *input,
+                                            size_t n_rows,
+                                            size_t n_cols,
+                                            float *labels,
+                                            float *coef,
+                                            float *intercept_device,
+                                            float *mu_input,
+                                            float *mu_labels,
+                                            bool fit_intercept,
+                                            int algo,
+                                            float *sample_weight) except +
+
+    cdef void olsFitDeviceInterceptWorkspace(handle_t& handle,
+                                            double *input,
+                                            size_t n_rows,
+                                            size_t n_cols,
+                                            double *labels,
+                                            double *coef,
+                                            double *intercept_device,
+                                            double *mu_input,
+                                            double *mu_labels,
+                                            bool fit_intercept,
+                                            int algo,
+                                            double *sample_weight) except +
+
+    cdef void olsFitDeviceInterceptWorkspaceAsyncInfo(handle_t& handle,
+                                                     float *input,
+                                                     size_t n_rows,
+                                                     size_t n_cols,
+                                                     float *labels,
+                                                     float *coef,
+                                                     float *intercept_device,
+                                                     float *mu_input,
+                                                     float *mu_labels,
+                                                     int *dev_info_out,
+                                                     bool fit_intercept,
+                                                     int algo,
+                                                     float *sample_weight) except +
+
+    cdef void olsFitDeviceInterceptWorkspaceAsyncInfo(handle_t& handle,
+                                                     double *input,
+                                                     size_t n_rows,
+                                                     size_t n_cols,
+                                                     double *labels,
+                                                     double *coef,
+                                                     double *intercept_device,
+                                                     double *mu_input,
+                                                     double *mu_labels,
+                                                     int *dev_info_out,
+                                   bool fit_intercept,
+                                   int algo,
+                                   double *sample_weight) except +
 
 
 class Algo(enum.IntEnum):
@@ -408,6 +544,603 @@ class LinearRegression(Base,
         self.coef_ = coef
 
         return self
+
+    def fit_many(
+        self,
+        train_pairs,
+        *,
+        max_concurrency=8,
+        eval_pairs=None,
+        scoring="r2",
+        return_models=True,
+        return_scores=False,
+        convert_dtype=True,
+    ):
+        """Fit many independent OLS models concurrently on a single GPU.
+
+        Parameters
+        ----------
+        train_pairs : iterable
+            Iterable of (X_train, y_train) pairs.
+        max_concurrency : int, default=8
+            Max number of CUDA streams/RAFT handles to use concurrently.
+        eval_pairs : iterable, optional
+            Iterable of (X_eval, y_eval) pairs. If provided and return_scores=True,
+            a score is computed per model after fitting.
+        scoring : str or callable, default='r2'
+            Scoring to use if `return_scores=True` and `eval_pairs` is provided.
+        return_models : bool, default=True
+            If True, return list of fitted estimator objects.
+        return_scores : bool, default=False
+            If True, return scores (requires `eval_pairs`).
+        convert_dtype : bool, default=True
+            Whether to convert input data to float32/float64 as in `.fit()`.
+
+        Returns
+        -------
+        models : list[LinearRegression]
+            Returned if return_models=True.
+        scores : array-like
+            Returned if return_scores=True.
+        """
+        train_pairs = list(train_pairs)
+        n_models = len(train_pairs)
+        if n_models == 0:
+            if return_models and return_scores:
+                return [], cp.asarray([], dtype=cp.float32)
+            elif return_models:
+                return []
+            else:
+                return cp.asarray([], dtype=cp.float32)
+
+        if max_concurrency is None:
+            max_concurrency = n_models
+        if not isinstance(max_concurrency, int) or max_concurrency < 1:
+            raise ValueError("max_concurrency must be a positive integer")
+        n_workers = min(max_concurrency, n_models)
+
+        if eval_pairs is not None:
+            eval_pairs = list(eval_pairs)
+            if len(eval_pairs) != n_models:
+                raise ValueError("eval_pairs must have the same length as train_pairs")
+        if return_scores and eval_pairs is None:
+            raise ValueError("return_scores=True requires eval_pairs")
+        if scoring != "r2":
+            raise NotImplementedError("Only scoring='r2' is supported in fit_many for now")
+
+        # Create independent handles. Use a small stream pool so RAFT internals (e.g., lstsqEig)
+        # can overlap independent gemm/gemv work without forcing global synchronizations.
+        handles = [Handle(n_streams=2) for _ in range(n_workers)]
+
+        # Cython typed locals must be declared before use (including in slice fast-path packing).
+        cdef handle_t* handle_
+        cdef uintptr_t stream_ptr
+        cdef int algo
+        cdef size_t n_rows
+        cdef size_t n_cols
+        cdef uintptr_t X_ptr
+        cdef uintptr_t y_ptr
+        cdef uintptr_t coef_ptr
+        cdef uintptr_t intercept_ptr
+        cdef uintptr_t mu_input_ptr
+        cdef uintptr_t mu_labels_ptr
+        cdef uintptr_t info_ptr
+        cdef uintptr_t sample_weight_ptr
+        cdef bool is_float32
+        cdef bool fit_intercept
+
+        # Slice fast-path: train_pairs items may be (X_base, y_base, slice) to avoid per-window materialization.
+        slice_mode = (
+            n_models > 0
+            and isinstance(train_pairs[0], tuple)
+            and len(train_pairs[0]) == 3
+            and isinstance(train_pairs[0][2], slice)
+        )
+        if slice_mode:
+            X_base0, y_base0, _sl0 = train_pairs[0]
+            for t in train_pairs:
+                if not (isinstance(t, tuple) and len(t) == 3 and isinstance(t[2], slice)):
+                    slice_mode = False
+                    break
+                if t[0] is not X_base0 or t[1] is not y_base0:
+                    # Keep v1 simple: require a single shared base X/y.
+                    slice_mode = False
+                    break
+
+        # Pre-scan shapes so we can allocate reusable per-worker buffers (avoids cudaMalloc/cudaFree churn).
+        # This assumes all problems have the same number of features, which is typical for walk-forward CV.
+        cdef size_t max_rows = 0
+        cdef size_t common_cols = 0
+        work_dtype = None
+        for item in train_pairs:
+            if slice_mode:
+                X_i, y_i, sl = item
+            else:
+                X_i, y_i = item
+            # Avoid `input_to_cuml_array` during the prescan: it can trigger tiny device copies
+            # (dtype/order conversion) and we only need shapes here.
+            if common_cols == 0:
+                common_cols = <size_t>X_i.shape[1]
+            elif <size_t>X_i.shape[1] != common_cols:
+                raise ValueError(
+                    "fit_many requires a constant number of features across all train_pairs"
+                )
+
+            if slice_mode:
+                if sl.step not in (None, 1):
+                    raise ValueError("slice fast-path requires step=None or 1")
+                start = 0 if sl.start is None else int(sl.start)
+                stop = int(sl.stop) if sl.stop is not None else int(X_i.shape[0])
+                n_r = max(0, stop - start)
+                if <size_t>n_r > max_rows:
+                    max_rows = <size_t>n_r
+            else:
+                if <size_t>X_i.shape[0] > max_rows:
+                    max_rows = <size_t>X_i.shape[0]
+
+            if work_dtype is None:
+                if convert_dtype:
+                    # Match `.fit()` behavior when convert_dtype=True:
+                    # - Preserve float32/float64 inputs
+                    # - Convert other numeric types to float32
+                    dt = getattr(X_i, "dtype", None)
+                    if dt is None and hasattr(X_i, "dtypes"):
+                        # cudf.DataFrame path
+                        dts = X_i.dtypes
+                        dt = dts.iloc[0] if hasattr(dts, "iloc") else dts[0]
+                    if dt in (np.float32, np.float64):
+                        work_dtype = dt
+                    else:
+                        work_dtype = np.float32
+                else:
+                    # Keep input dtype (must be float32/float64 to preserve libcuml behavior).
+                    dt = getattr(X_i, "dtype", None)
+                    if dt is None and hasattr(X_i, "dtypes"):
+                        # cudf.DataFrame path
+                        dts = X_i.dtypes
+                        dt = dts.iloc[0] if hasattr(dts, "iloc") else dts[0]
+                    if dt not in (np.float32, np.float64):
+                        raise ValueError(
+                            "fit_many requires float32/float64 inputs when convert_dtype=False"
+                        )
+                    work_dtype = dt
+
+        if common_cols == 0 or max_rows < 2:
+            raise ValueError("Invalid train_pairs inputs")
+
+        # Allocate per-worker scratch buffers once (and cache them across calls).
+        cache = getattr(self, "_fit_many_worker_cache", None)
+        reuse_ok = (
+            cache is not None
+            and cache.get("dtype") == work_dtype
+            and cache.get("common_cols") == int(common_cols)
+            and cache.get("n_workers") == int(n_workers)
+            and cache.get("max_rows", 0) >= int(max_rows)
+        )
+
+        if reuse_ok:
+            work_X = cache["work_X"]
+            work_y = cache["work_y"]
+            work_mu_input = cache["work_mu_input"]
+            work_mu_labels = cache["work_mu_labels"]
+        else:
+            # We copy each window into scratch on that worker's stream so the solver can safely mutate
+            # without touching user data.
+            work_X = []
+            work_y = []
+            work_mu_input = []
+            work_mu_labels = []
+            for w in range(n_workers):
+                work_X.append(CumlArray.empty((max_rows, common_cols), dtype=work_dtype, order="F"))
+                work_y.append(CumlArray.empty((max_rows,), dtype=work_dtype, order="F"))
+                # Workspace for fit_intercept centering (avoids per-fit device allocations)
+                work_mu_input.append(CumlArray.empty((common_cols,), dtype=work_dtype, order="F"))
+                work_mu_labels.append(CumlArray.empty((1,), dtype=work_dtype, order="F"))
+            self._fit_many_worker_cache = {
+                "dtype": work_dtype,
+                "max_rows": int(max_rows),
+                "common_cols": int(common_cols),
+                "n_workers": int(n_workers),
+                "work_X": work_X,
+                "work_y": work_y,
+                "work_mu_input": work_mu_input,
+                "work_mu_labels": work_mu_labels,
+            }
+
+        # Allocate outputs in one contiguous block to avoid per-model allocations.
+        # IMPORTANT: store as (n_features, n_models) in F-order so each model's coef_ is contiguous.
+        out_coef = CumlArray.empty((common_cols, n_models), dtype=work_dtype, order="F")
+        out_intercepts = CumlArray.empty((n_models,), dtype=work_dtype, order="F")
+        # Per-fit solver info (2 ints per model: primary + secondary for QR)
+        out_info = CumlArray.empty((n_models, 2), dtype=np.int32, order="C")
+        out_info_cupy = out_info.to_output("cupy")
+
+        # Spawn per-fit estimators with the same hyperparameters.
+        models = []
+        if return_models:
+            for i in range(n_models):
+                models.append(
+                    LinearRegression(
+                        algorithm=self.algorithm,
+                        fit_intercept=self.fit_intercept,
+                        copy_X=self.copy_X,
+                        handle=handles[i % n_workers],
+                        verbose=self.verbose,
+                        output_type=self.output_type,
+                    )
+                )
+
+        # Store outputs for later materialization
+        coefs = [None] * n_models
+        intercept_devs = [None] * n_models
+        dtypes = [None] * n_models
+        n_features = [None] * n_models
+        # Keep temporary converted (safe-to-mutate) inputs alive until all streams finish.
+        tmp_keepalive = []
+
+        # Slice fast-path packing state
+        pack_X_cupy = None
+        pack_y_cupy = None
+        local_pos_for_model = None
+        base_keepalive = None
+
+        if slice_mode:
+            # Convert base arrays to CuPy once. For non-CuPy inputs this may allocate,
+            # but avoids per-window conversion/copy overhead.
+            if hasattr(X_base0, "to_cupy"):
+                X_base_cp = X_base0.to_cupy()
+            elif hasattr(X_base0, "to_output"):
+                X_base_cp = X_base0.to_output("cupy")
+            else:
+                X_base_cp = cp.asarray(X_base0)
+
+            if hasattr(y_base0, "to_cupy"):
+                y_base_cp = y_base0.to_cupy()
+            elif hasattr(y_base0, "to_output"):
+                y_base_cp = y_base0.to_output("cupy")
+            else:
+                y_base_cp = cp.asarray(y_base0)
+            y_base_cp = y_base_cp.reshape(-1)
+
+            # Ensure dtype matches work_dtype (preserve float64 when requested).
+            if X_base_cp.dtype != work_dtype:
+                X_base_cp = X_base_cp.astype(work_dtype, copy=True, order="A")
+            if y_base_cp.dtype != work_dtype:
+                y_base_cp = y_base_cp.astype(work_dtype, copy=True, order="A")
+            base_keepalive = (X_base_cp, y_base_cp)
+
+            # Build per-worker model lists and slice parameters.
+            worker_ids = [[] for _ in range(n_workers)]
+            starts_by_worker = [[] for _ in range(n_workers)]
+            lens_by_worker = [[] for _ in range(n_workers)]
+            n_rows_by_model = [0] * n_models
+            local_pos_for_model = [0] * n_models
+
+            for i, (_Xb, _yb, sl) in enumerate(train_pairs):
+                worker = i % n_workers
+                start = 0 if sl.start is None else int(sl.start)
+                stop = int(sl.stop) if sl.stop is not None else int(X_base_cp.shape[0])
+                if sl.step not in (None, 1):
+                    raise ValueError("slice fast-path requires step=None or 1")
+                n_r = max(0, stop - start)
+                n_rows_by_model[i] = n_r
+                local_pos_for_model[i] = len(worker_ids[worker])
+                worker_ids[worker].append(i)
+                starts_by_worker[worker].append(start)
+                lens_by_worker[worker].append(n_r)
+
+            # Allocate packed buffers per worker (3D for X, 2D for y).
+            pack_X_cupy = [None] * n_workers
+            pack_y_cupy = [None] * n_workers
+            for w in range(n_workers):
+                k = len(worker_ids[w])
+                if k == 0:
+                    continue
+                Xp = CumlArray.empty((max_rows, common_cols, k), dtype=work_dtype, order="F").to_output("cupy")
+                yp = CumlArray.empty((max_rows, k), dtype=work_dtype, order="F").to_output("cupy")
+                pack_X_cupy[w] = Xp
+                pack_y_cupy[w] = yp
+
+                starts_d = cp.asarray(starts_by_worker[w], dtype=cp.int64)
+                lens_d = cp.asarray(lens_by_worker[w], dtype=cp.int64)
+
+                kx, ky = _get_pack_slice_kernels(work_dtype)
+                # Strides in elements (not bytes)
+                x_s0 = X_base_cp.strides[0] // X_base_cp.itemsize
+                x_s1 = X_base_cp.strides[1] // X_base_cp.itemsize
+                o_s0 = Xp.strides[0] // Xp.itemsize
+                o_s1 = Xp.strides[1] // Xp.itemsize
+                o_s2 = Xp.strides[2] // Xp.itemsize
+                y_s0 = y_base_cp.strides[0] // y_base_cp.itemsize
+                yo_s0 = yp.strides[0] // yp.itemsize
+                yo_s1 = yp.strides[1] // yp.itemsize
+
+                # Launch packing on the worker stream so it is ordered before the fit calls.
+                handle_py = handles[w]
+                handle_ = <handle_t*><size_t>handle_py.getHandle()
+                stream_ptr = <uintptr_t>handle_[0].get_stream().value()
+                with cp.cuda.ExternalStream(int(stream_ptr)):
+                    # pack X: grid (rows, cols, k)
+                    tx, ty = 32, 4
+                    grid_x = (int(max_rows) + tx - 1) // tx
+                    grid_y = (int(common_cols) + ty - 1) // ty
+                    kx((grid_x, grid_y, k),
+                       (tx, ty, 1),
+                       (X_base_cp, x_s0, x_s1, int(common_cols), starts_d, lens_d, Xp, o_s0, o_s1, o_s2))
+                    # pack y: grid (rows, 1, k)
+                    tyb = 256
+                    grid_yb = (int(max_rows) + tyb - 1) // tyb
+                    ky((grid_yb, 1, k),
+                       (tyb, 1, 1),
+                       (y_base_cp, y_s0, starts_d, lens_d, yp, yo_s0, yo_s1))
+
+        # Enqueue fits
+        for i, item in enumerate(train_pairs):
+            worker = i % n_workers
+            handle_py = handles[worker]
+            handle_ = <handle_t*><size_t>handle_py.getHandle()
+            # pylibraft handle_t.get_stream() returns an rmm::cuda_stream_view; cupy needs cudaStream_t.
+            stream_ptr = <uintptr_t>handle_[0].get_stream().value()
+
+            # Ensure conversions/copies happen on the same CUDA stream as the fit.
+            with cp.cuda.ExternalStream(int(stream_ptr)):
+                if slice_mode:
+                    # Inputs are already packed into per-worker buffers.
+                    _Xb, _yb, sl = item
+                    # Compute n_rows for this model
+                    start = 0 if sl.start is None else int(sl.start)
+                    stop = int(sl.stop) if sl.stop is not None else int(base_keepalive[0].shape[0])
+                    n_r = max(0, stop - start)
+                    if n_r < 2:
+                        raise ValueError("X matrix must have at least two rows")
+                    n_rows = <size_t>n_r
+                    n_cols = common_cols
+
+                    pos = local_pos_for_model[i]
+                    Xw_view = pack_X_cupy[worker][:n_rows, :n_cols, pos]
+                    yw_view = pack_y_cupy[worker][:n_rows, pos]
+                    X_ptr = Xw_view.data.ptr
+                    y_ptr = yw_view.data.ptr
+
+                    # algorithm selection based on shapes only
+                    algo = self._select_algo(Xw_view, yw_view)
+                    coef = out_coef[:, i]
+                    intercept_dev = out_intercepts[i : i + 1]
+                    info_ptr = <uintptr_t>(out_info_cupy.data.ptr + i * 2 * sizeof(int32_t))
+                    coefs[i] = coef
+                    intercept_devs[i] = intercept_dev
+                    dtypes[i] = work_dtype
+                    n_features[i] = n_cols
+                    coef_ptr = coef.ptr
+                    intercept_ptr = intercept_dev.ptr
+                    mu_input_ptr = work_mu_input[worker].ptr
+                    mu_labels_ptr = work_mu_labels[worker].ptr
+                    sample_weight_ptr = 0
+                    is_float32 = (work_dtype == np.float32)
+                    fit_intercept = self.fit_intercept
+
+                    with nogil:
+                        if is_float32:
+                            olsFitDeviceInterceptWorkspaceAsyncInfo(
+                                handle_[0],
+                                <float*>X_ptr,
+                                n_rows,
+                                n_cols,
+                                <float*>y_ptr,
+                                <float*>coef_ptr,
+                                <float*>intercept_ptr,
+                                <float*>mu_input_ptr,
+                                <float*>mu_labels_ptr,
+                                <int*>info_ptr,
+                                fit_intercept,
+                                algo,
+                                <float*>sample_weight_ptr,
+                            )
+                        else:
+                            olsFitDeviceInterceptWorkspaceAsyncInfo(
+                                handle_[0],
+                                <double*>X_ptr,
+                                n_rows,
+                                n_cols,
+                                <double*>y_ptr,
+                                <double*>coef_ptr,
+                                <double*>intercept_ptr,
+                                <double*>mu_input_ptr,
+                                <double*>mu_labels_ptr,
+                                <int*>info_ptr,
+                                fit_intercept,
+                                algo,
+                                <double*>sample_weight_ptr,
+                            )
+                    continue
+
+                X_i, y_i = item
+                # Avoid `input_to_cuml_array`: it may introduce extra small copies for dtype/order
+                # conversion before we pack into scratch anyway.
+                if hasattr(X_i, "to_cupy"):
+                    X_cp = X_i.to_cupy()
+                elif hasattr(X_i, "to_output"):
+                    X_cp = X_i.to_output("cupy")
+                else:
+                    X_cp = cp.asarray(X_i)
+
+                if X_cp.shape[0] < 2:
+                    raise ValueError("X matrix must have at least two rows")
+                if X_cp.shape[1] < 1:
+                    raise ValueError("X matrix must have at least one column")
+                if <size_t>X_cp.shape[1] != common_cols:
+                    raise ValueError(
+                        "fit_many requires a constant number of features across all train_pairs"
+                    )
+
+                if hasattr(y_i, "to_cupy"):
+                    y_cp = y_i.to_cupy()
+                elif hasattr(y_i, "to_output"):
+                    y_cp = y_i.to_output("cupy")
+                else:
+                    y_cp = cp.asarray(y_i)
+                if y_cp.shape[0] != X_cp.shape[0]:
+                    raise ValueError("y must have the same number of rows as X")
+
+                # NOTE: `sample_weight` per-model is not yet supported in v1.
+                sample_weight = None
+
+                # Validate dtype constraints. If convert_dtype=True we cast into scratch.
+                if not convert_dtype and X_cp.dtype != work_dtype:
+                    raise ValueError("fit_many requires a constant dtype across all train_pairs")
+
+                algo = self._select_algo(X_cp, y_cp)
+                if y_cp.ndim > 1 and y_cp.shape[1] > 1:
+                    raise ValueError(
+                        "fit_many currently supports only single-target y; "
+                        "use algorithm='svd' and sequential .fit() for multi-target."
+                    )
+
+                # Views into the preallocated output buffers (no per-model allocations)
+                coef = out_coef[:, i]
+                intercept_dev = out_intercepts[i : i + 1]
+                info_ptr = <uintptr_t>(out_info_cupy.data.ptr + i * 2 * sizeof(int32_t))
+
+                coefs[i] = coef
+                intercept_devs[i] = intercept_dev
+                dtypes[i] = work_dtype
+                n_features[i] = X_cp.shape[1]
+
+                n_rows = X_cp.shape[0]
+                n_cols = X_cp.shape[1]
+                # If dtype conversion is required, use the same conversion path as `.fit()` to preserve
+                # bit-for-bit behavior (notably for float64 inputs). The returned arrays are safe to mutate.
+                if convert_dtype and (X_cp.dtype != work_dtype or y_cp.dtype != work_dtype):
+                    X_m = input_to_cuml_array(
+                        X_i,
+                        convert_to_dtype=work_dtype,
+                        check_dtype=[np.float32, np.float64],
+                        order="F",
+                        deepcopy=True,
+                    ).array
+                    y_m = input_to_cuml_array(
+                        y_i,
+                        check_dtype=work_dtype,
+                        convert_to_dtype=work_dtype,
+                        check_rows=X_m.shape[0],
+                        order="F",
+                        deepcopy=True,
+                    ).array
+                    tmp_keepalive.append((X_m, y_m))
+                    X_ptr = X_m.ptr
+                    y_ptr = y_m.ptr
+                else:
+                    # Copy inputs into per-worker scratch so solver can safely mutate, without touching user data.
+                    Xw = work_X[worker].to_output("cupy")
+                    yw = work_y[worker].to_output("cupy")
+                    Xw_view = Xw[:n_rows, :n_cols]
+                    yw_view = yw[:n_rows]
+                    # For non-contig window slices, this is an unavoidable gather copy; keep it single-pass.
+                    cp.copyto(Xw_view, X_cp)
+                    cp.copyto(yw_view, y_cp.reshape(-1))
+                    X_ptr = Xw_view.data.ptr
+                    y_ptr = yw_view.data.ptr
+                coef_ptr = coef.ptr
+                intercept_ptr = intercept_dev.ptr
+                mu_input_ptr = work_mu_input[worker].ptr
+                mu_labels_ptr = work_mu_labels[worker].ptr
+                sample_weight_ptr = 0
+                is_float32 = (work_dtype == np.float32)
+                fit_intercept = self.fit_intercept
+
+                with nogil:
+                    if is_float32:
+                        olsFitDeviceInterceptWorkspaceAsyncInfo(
+                            handle_[0],
+                            <float*>X_ptr,
+                            n_rows,
+                            n_cols,
+                            <float*>y_ptr,
+                            <float*>coef_ptr,
+                            <float*>intercept_ptr,
+                            <float*>mu_input_ptr,
+                            <float*>mu_labels_ptr,
+                            <int*>info_ptr,
+                            fit_intercept,
+                            algo,
+                            <float*>sample_weight_ptr,
+                        )
+                    else:
+                        olsFitDeviceInterceptWorkspaceAsyncInfo(
+                            handle_[0],
+                            <double*>X_ptr,
+                            n_rows,
+                            n_cols,
+                            <double*>y_ptr,
+                            <double*>coef_ptr,
+                            <double*>intercept_ptr,
+                            <double*>mu_input_ptr,
+                            <double*>mu_labels_ptr,
+                            <int*>info_ptr,
+                            fit_intercept,
+                            algo,
+                            <double*>sample_weight_ptr,
+                        )
+
+        # Synchronize once per worker handle.
+        for h in handles:
+            h.sync()
+
+        # Validate solver status once (avoids per-fit host syncs).
+        info_host = out_info.to_output("numpy")
+        # For QR (algo=2): both entries must be 0. For EIG (algo=1): first entry must be 0.
+        # For SVD paths, reference implementation does not report devInfo; they remain 0.
+        if (info_host != 0).any():
+            # Report first failing model and the two info values.
+            import numpy as _np
+            bad = _np.argwhere(info_host != 0)[0]
+            i_bad = int(bad[0])
+            raise RuntimeError(
+                f"fit_many solver failure at model {i_bad}: dev_info={info_host[i_bad].tolist()}"
+            )
+
+        # Materialize fitted estimators and optional scores.
+        out_scores = None
+        if return_scores:
+            out_scores = cp.empty(n_models, dtype=cp.float64)
+
+        for i in range(n_models):
+            intercept_val = intercept_devs[i].to_output("cupy")[0].item()
+            if return_models:
+                m = models[i]
+                # Mimic @reflect(reset=True) behavior for each fit
+                m._set_output_type(train_pairs[i][0])
+                m._set_n_features_in(n_features[i])
+                m.coef_ = coefs[i]
+                m.intercept_ = intercept_val
+
+            if return_scores:
+                X_eval, y_eval = eval_pairs[i]
+                if return_models:
+                    # Use estimator's existing scoring API (R2)
+                    out_scores[i] = models[i].score(X_eval, y_eval)
+                else:
+                    # If not returning models, compute score via a temporary model
+                    tmp = LinearRegression(
+                        algorithm=self.algorithm,
+                        fit_intercept=self.fit_intercept,
+                        copy_X=self.copy_X,
+                        handle=handles[i % n_workers],
+                        verbose=self.verbose,
+                        output_type=self.output_type,
+                    )
+                    tmp._set_output_type(train_pairs[i][0])
+                    tmp._set_n_features_in(n_features[i])
+                    tmp.coef_ = coefs[i]
+                    tmp.intercept_ = intercept_val
+                    out_scores[i] = tmp.score(X_eval, y_eval)
+
+        if return_models and return_scores:
+            return models, out_scores
+        elif return_models:
+            return models
+        else:
+            return out_scores
 
     def _fit_multi_target(
         self, X_m, y_m, sample_weight_m=None, X_is_copy=False, y_is_copy=False,

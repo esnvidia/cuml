@@ -13,8 +13,16 @@ from cuml.model_selection._split import (
     StratifiedKFold,
     train_test_split,
 )
+from cuml.model_selection._parallel_fit import parallel_fit, ParallelFitResult
 
-__all__ = ["train_test_split", "KFold", "GridSearchCV", "StratifiedKFold"]
+__all__ = [
+    "train_test_split",
+    "KFold",
+    "GridSearchCV",
+    "StratifiedKFold",
+    "parallel_fit",
+    "ParallelFitResult",
+]
 
 
 def __getattr__(name):

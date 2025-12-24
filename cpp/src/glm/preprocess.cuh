@@ -6,6 +6,7 @@
 #pragma once
 
 #include <raft/core/handle.hpp>
+#include <raft/core/copy.cuh>
 #include <raft/linalg/gemm.cuh>
 #include <raft/linalg/subtract.cuh>
 #include <raft/matrix/math.cuh>
@@ -106,6 +107,44 @@ void postProcessData(const raft::handle_t& handle,
 
   raft::linalg::subtract(d_intercept.data(), mu_labels, d_intercept.data(), 1, stream);
   *intercept = d_intercept.value(stream);
+
+  raft::stats::meanAdd<false, true>(input, input, mu_input, n_cols, n_rows, stream);
+  raft::stats::meanAdd<false, true>(labels, labels, mu_labels, (size_t)1, n_rows, stream);
+}
+
+template <typename math_t>
+void postProcessDataDeviceIntercept(const raft::handle_t& handle,
+                                    math_t* input,
+                                    size_t n_rows,
+                                    size_t n_cols,
+                                    math_t* labels,
+                                    math_t* coef,
+                                    math_t* intercept_device,
+                                    math_t* mu_input,
+                                    math_t* mu_labels,
+                                    bool fit_intercept)
+{
+  cudaStream_t stream = handle.get_stream();
+  raft::common::nvtx::range fun_scope(
+    "ML::GLM::postProcessDataDeviceIntercept-%d-%d", n_rows, n_cols);
+  ASSERT(n_cols > 0, "Parameter n_cols: number of columns cannot be less than one");
+  ASSERT(n_rows > 1, "Parameter n_rows: number of rows cannot be less than two");
+
+  // Avoid per-fit allocations/synchronization: write intercept directly to device memory.
+  // intercept = mu_labels - mu_input @ coef
+  raft::linalg::gemm(handle,
+                     mu_input,
+                     (size_t)1,
+                     n_cols,
+                     coef,
+                     intercept_device,
+                     1,
+                     1,
+                     CUBLAS_OP_N,
+                     CUBLAS_OP_N,
+                     stream);
+
+  raft::linalg::subtract(intercept_device, mu_labels, intercept_device, 1, stream);
 
   raft::stats::meanAdd<false, true>(input, input, mu_input, n_cols, n_rows, stream);
   raft::stats::meanAdd<false, true>(labels, labels, mu_labels, (size_t)1, n_rows, stream);
